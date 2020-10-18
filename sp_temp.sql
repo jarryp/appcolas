@@ -1,0 +1,638 @@
+USE [BACLINK]
+GO
+/****** Object:  StoredProcedure [dbo].[USP_GET_PAYMENT_SUMMARY_FROM_AS400]    Script Date: 7/10/2020 10:41:43 ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+ALTER procedure [dbo].[USP_GET_PAYMENT_SUMMARY_FROM_AS400]
+	@IDAFFILIATE INT,
+	@VILCULATEDSERVERNAME VARCHAR(100),
+	@STARTDATE VARCHAR(100),
+	@ENDDATE VARCHAR(100),
+	@RESPONSE_MODE INT,
+	@IN_CHANNEL VARCHAR(100) AS
+
+BEGIN
+ DECLARE @PRODUCT                 VARCHAR(5000)
+ DECLARE @PRODUCT_ALL             VARCHAR(MAX)
+ DECLARE @PRODUCT_AUX             VARCHAR(20)
+ DECLARE @CLIENT                  INT
+ DECLARE @CHANNEL                 VARCHAR(10)
+ DECLARE @NUMROWS_AFILIATES       INT
+ DECLARE @NUMROWS                 INT
+ DECLARE @I                       INT
+ DECLARE @TABLEAFILIATEROW        INT
+ DECLARE @TABLEROW                INT
+ DECLARE @LASTDATE_DATA_MIGRATION DATE 
+ DECLARE @DATEINIT                VARCHAR(100)
+ DECLARE @FLAGPROCESS             BIT 
+ DECLARE @PAYDATE                 VARCHAR(10)
+
+ SET @FLAGPROCESS = 1
+ SET @DATEINIT = @STARTDATE
+ SET @LASTDATE_DATA_MIGRATION = (SELECT MAX(PAYDATE) FROM BL_TA_PAYMENTS_SUMMARY) 
+
+ IF @LASTDATE_DATA_MIGRATION>CONVERT(VARCHAR,@STARTDATE,120)
+ BEGIN
+	SET @STARTDATE = DATEADD(DAY,1,@LASTDATE_DATA_MIGRATION)
+ END
+
+ IF @LASTDATE_DATA_MIGRATION > CONVERT(VARCHAR,@ENDDATE,120)
+ BEGIN
+	SET @FLAGPROCESS = 0
+ END
+
+ SET @NUMROWS_AFILIATES = 0;
+ SET @PRODUCT           = ''
+ SET @PRODUCT_ALL       = ''
+
+ DECLARE @SQL_AFILIATESNAMES NVARCHAR(max) = ' select * from openquery('+@VILCULATEDSERVERNAME+',
+  ''SELECT (ROW_NUMBER() OVER(ORDER BY a.DSC903)) AS RN, 
+           p.PRO952 AS PRODUCT ,
+		   a.DSC903 AS DESCRIPTION,
+		   (SELECT count(*) 
+		    from  wwcmdatpro.wwa952 
+			where pro952=p.PRO952 
+			  and sec952=''''PAYMENT''''
+			  AND ADD952 LIKE ''''%baclink-api/soap/bacLink.wsdl%'''' ) AS CLIENT
+	FROM wwcmdatpro.wwa952 p 
+	left join wwcmdatpro.wwa903 a on a.PRO080 = p.PRO952 and a.CMP070 = p.CMP952  
+	where p.sec952=''''PAYMENT''''
+	  AND p.CMP952=''''CRCM''''
+	  AND a.ACT903=''''S''''
+	order by  a.DSC903 '') '
+
+DECLARE @AFFILIATETABLE TABLE(RN INT,PRODUCT VARCHAR(10), DESCRIPTION VARCHAR(100), CLIENT INT)
+
+INSERT INTO @AFFILIATETABLE (RN,PRODUCT, DESCRIPTION, CLIENT) 
+EXEC sp_executesql @SQL_AFILIATESNAMES
+
+
+
+IF @FLAGPROCESS=1
+BEGIN 
+SET @I = 1
+SET @NUMROWS_AFILIATES = (SELECT COUNT(*) FROM @AFFILIATETABLE);
+	IF @NUMROWS_AFILIATES > 0
+		WHILE(@I <= (SELECT MAX(RN) FROM @AFFILIATETABLE))
+		BEGIN
+			SELECT @TABLEAFILIATEROW = RN, @CLIENT=CLIENT, @PRODUCT_AUX=LTRIM(RTRIM(PRODUCT))
+			 FROM @AFFILIATETABLE WHERE RN = @I;
+
+			IF @TABLEAFILIATEROW = @NUMROWS_AFILIATES
+			BEGIN
+				SET @PRODUCT_ALL = @PRODUCT_ALL + @PRODUCT_AUX
+				IF @CLIENT=1
+					SET @PRODUCT = @PRODUCT + @PRODUCT_AUX 
+			END
+			ELSE
+			BEGIN
+				SET @PRODUCT_ALL = @PRODUCT_ALL + @PRODUCT_AUX + ','
+				IF @CLIENT=1
+					SET @PRODUCT = @PRODUCT + @PRODUCT_AUX + ','
+			END
+			SET @I = @I + 1
+		END
+
+	SET @PRODUCT_ALL = ''''''+REPLACE(ltrim(rtrim(@PRODUCT_ALL)),',',''''',''''')+''''''
+	SET @PRODUCT = ''''+REPLACE(ltrim(rtrim(@PRODUCT)),',',''',''')+''''
+	SET @PRODUCT = REPLACE(@PRODUCT,',''''','')
+	
+	
+	PRINT @PRODUCT_ALL
+
+	DECLARE @SQL1 NVARCHAR(MAX) = 'select * 
+									from openquery('+@VILCULATEDSERVERNAME+',
+									''SELECT CAST(FEC910 AS DATE) AS PAYDATE, 
+											 PRO080 AS PRODUCT, 
+											 SRV910 AS CHANNEL, 
+											 CASE MPG910 
+												WHEN ''''DebCuenta'''' THEN ''''BCO'''' 
+												WHEN ''''Efectivo''''  THEN ''''BCO'''' 
+												WHEN ''''Tarjeta''''   THEN ''''COM''''
+											 END AS PAYMETHOD,
+											 RES910 AS RESPONSECODE,
+											 COUNT(*) AS QUANTITY,
+											 SUM(MON910) AS AMOUNT,
+											 SUM(COM910) AS COMMISSION 
+									 FROM wwcmdatpro.wwa910  
+									 WHERE PRO080 IN(' ;
+									 
+	DECLARE @SQL2 NVARCHAR(MAX)	= @PRODUCT_ALL ;
+	DECLARE @SQL3 NVARCHAR(MAX)	=')
+									   AND FEC910 >= '''''+@STARTDATE+''''' AND FEC910 <= '''''+@ENDDATE+''''' 
+									 GROUP BY CAST(FEC910 AS DATE), PRO080, SRV910 ,CASE MPG910 
+																		  WHEN ''''DebCuenta'''' THEN ''''BCO'''' 
+																		  WHEN ''''Efectivo'''' THEN ''''BCO'''' 
+																		  WHEN ''''Tarjeta'''' THEN ''''COM''''
+																	 END, RES910
+									 ORDER BY PAYDATE, PRODUCT, CHANNEL, PAYMETHOD, RESPONSECODE '') ';
+
+
+ DECLARE @SQL4 NVARCHAR(MAX) = (@SQL1+@SQL2+@SQL3 );
+ DECLARE @DATATABLE TABLE(PAYDATE VARCHAR(10),
+                          PRODUCT VARCHAR(8),
+						  CHANNEL VARCHAR(10),
+						  PAYMETHOD VARCHAR(10),
+						  RESPONSECODE VARCHAR(30),
+						  QUANTITY INT,
+						  AMOUNT NUMERIC(19,2),
+						  COMMISSION NUMERIC(19,2))
+
+	INSERT INTO @DATATABLE (PAYDATE,PRODUCT,CHANNEL,PAYMETHOD,RESPONSECODE,QUANTITY,AMOUNT,COMMISSION)
+	
+	EXEC sp_executesql @SQL4
+
+DECLARE @SUMMARYTABLE TABLE(RN INT, PAYDATE VARCHAR(10),
+									PRODUCT VARCHAR(10),
+									CHANNEL VARCHAR(10),
+									BCO_PROCESSED INT,
+									BCO_REJECTED INT,
+									BCO_RETENIDITY INT,
+									BCO_RETAINEDAS400 INT,
+									BCO_CANCELED INT,
+									BCO_TOTAL INT,
+									BCO_SUCCESS INT,
+									BCO_EFFECTIVENESS INT,
+									BCO_AMOUNT NUMERIC(19,2),
+									BCO_COMMISSION NUMERIC(19,2),
+									COM_PROCESSED INT,
+									COM_REJECTED INT,
+									COM_RETENIDITY INT,
+									COM_RETAINEDAS400 INT,
+									COM_CANCELED INT,
+									COM_TOTAL INT,
+									COM_SUCCESS INT,
+									COM_EFFECTIVENESS INT,
+									COM_AMOUNT NUMERIC(19,2),
+									COM_COMMISSION NUMERIC(19,2))
+
+DECLARE @SUMMARYTABLE_REJECTED TABLE(RN INT, PAYDATE VARCHAR(10),
+									PRODUCT VARCHAR(10),
+									CHANNEL VARCHAR(10),
+									BCO_PROCESSED INT,
+									BCO_REJECTED INT,
+									BCO_RETENIDITY INT,
+									BCO_RETAINEDAS400 INT,
+									BCO_CANCELED INT,
+									BCO_TOTAL INT,
+									BCO_SUCCESS INT,
+									BCO_EFFECTIVENESS INT,
+									BCO_AMOUNT NUMERIC(19,2),
+									BCO_COMMISSION NUMERIC(19,2),
+									COM_PROCESSED INT,
+									COM_REJECTED INT,
+									COM_RETENIDITY INT,
+									COM_RETAINEDAS400 INT,
+									COM_CANCELED INT,
+									COM_TOTAL INT,
+									COM_SUCCESS INT,
+									COM_EFFECTIVENESS INT,
+									COM_AMOUNT NUMERIC(19,2),
+									COM_COMMISSION NUMERIC(19,2))
+
+INSERT INTO @SUMMARYTABLE (RN,
+                                 PAYDATE,PRODUCT,CHANNEL,BCO_PROCESSED,BCO_REJECTED,
+                                 BCO_RETENIDITY,BCO_RETAINEDAS400,BCO_CANCELED,BCO_TOTAL,BCO_SUCCESS,
+								 BCO_EFFECTIVENESS,BCO_AMOUNT,BCO_COMMISSION,COM_PROCESSED,COM_REJECTED,
+								 COM_RETENIDITY,COM_RETAINEDAS400,COM_CANCELED,COM_TOTAL,COM_SUCCESS,
+								 COM_EFFECTIVENESS, COM_AMOUNT, COM_COMMISSION ) 
+SELECT (ROW_NUMBER() OVER(ORDER BY PAYDATE,PRODUCT,CHANNEL)) AS RN, 
+                     d.PAYDATE, d.PRODUCT, d.CHANNEL, 
+	                 d.BCO_PROCESSED, d.BCO_REJECTED, d.BCO_RETENIDITY, d.BCO_RETAINEDAS400, d.BCO_CANCELED, d.BCO_TOTAL, d.BCO_SUCCESS,
+					 CASE d.BCO_TOTAL
+					   WHEN 0 THEN 0
+					   ELSE ((d.BCO_SUCCESS*100)/d.BCO_TOTAL )
+					 END AS BCO_EFFECTIVENESS,
+					 ISNULL(d.BCO_AMOUNT,0) AS BCO_AMOUNT, ISNULL(d.BCO_COMMISSION,0) AS BCO_COMMISSION,
+		             d.COM_PROCESSED, d.COM_REJECTED, d.COM_RETENIDITY, d.COM_RETAINEDAS400,  d.COM_CANCELED, d.COM_TOTAL, d.COM_SUCCESS,
+					 CASE d.COM_TOTAL
+						WHEN 0 THEN 0
+						ELSE ((d.COM_SUCCESS*100)/d.COM_TOTAL )
+					 END AS COM_EFFECTIVENESS , 
+					 ISNULL(d.COM_AMOUNT,0) AS COM_AMOUNT,  ISNULL(d.COM_COMMISSION,0) AS COM_COMMISSION  
+	FROM (
+	SELECT ISNULL(a.PAYDATE,b.PAYDATE)   AS PAYDATE,
+	       ISNULL(a.PRODUCT,b.PRODUCT)   AS PRODUCT,
+		   ISNULL(a.CHANNEL,b.CHANNEL)   AS CHANNEL,
+		   ISNULL(a.BCO_PROCESSED,0)     as BCO_PROCESSED,
+		   ISNULL(a.BCO_REJECTED,0)      as BCO_REJECTED,
+		   ISNULL(a.BCO_RETENIDITY,0)    as BCO_RETENIDITY,
+		   ISNULL(a.BCO_RETAINEDAS400,0) as BCO_RETAINEDAS400,
+		   ISNULL(a.BCO_CANCELED,0)      as BCO_CANCELED,
+		   ISNULL(a.BCO_TOTAL,0)         as BCO_TOTAL,
+		   ISNULL(a.BCO_SUCCESS,0)       as BCO_SUCCESS,
+		   ISNULL(a.BCO_AMOUNT,0)        as BCO_AMOUNT,
+		   ISNULL(a.BCO_COMMISSION,0)    as BCO_COMMISSION,
+		   ISNULL(b.COM_PROCESSED,0)     as COM_PROCESSED,
+		   ISNULL(b.COM_REJECTED,0)      as COM_REJECTED,
+		   ISNULL(b.COM_RETENIDITY,0)    as COM_RETENIDITY,
+		   ISNULL(b.COM_RETAINEDAS400,0) as COM_RETAINEDAS400,
+		   ISNULL(b.COM_CANCELED,0)      as COM_CANCELED,
+		   ISNULL(b.COM_TOTAL,0)         as COM_TOTAL,
+		   ISNULL(b.COM_SUCCESS,0)       as COM_SUCCESS,
+		   ISNULL(b.COM_AMOUNT,0)        as COM_AMOUNT,
+		   ISNULL(b.COM_COMMISSION,0)    as COM_COMMISSION 
+	FROM (SELECT P.PAYDATE, P.PRODUCT,p.CHANNEL , 
+	       ISNULL(B1.QUANTITY,0) AS BCO_PROCESSED,
+		   ISNULL(B2.QUANTITY,0) AS BCO_REJECTED,
+		   ISNULL(B3.QUANTITY,0) AS BCO_RETENIDITY,
+		   ISNULL(B4.QUANTITY,0) AS BCO_RETAINEDAS400,
+		   ISNULL(B5.QUANTITY,0) AS BCO_CANCELED,
+		   (ISNULL(B1.QUANTITY,0)+ISNULL(B2.QUANTITY,0)+ISNULL(B3.QUANTITY,0)+ISNULL(B4.QUANTITY,0)+ISNULL(B5.QUANTITY,0)) AS BCO_TOTAL,
+		   ((ISNULL(B1.QUANTITY,0)+ISNULL(B2.QUANTITY,0)+ISNULL(B3.QUANTITY,0)+ISNULL(B4.QUANTITY,0)+ISNULL(B5.QUANTITY,0))-
+		   (ISNULL(B2.QUANTITY,0)+ISNULL(B3.QUANTITY,0)+ISNULL(B4.QUANTITY,0)+ISNULL(B5.QUANTITY,0))) AS BCO_SUCCESS,
+		   B1.AMOUNT as BCO_AMOUNT, B1.COMMISSION AS BCO_COMMISSION
+	FROM (SELECT PAYDATE, PRODUCT ,CHANNEL
+	      FROM @DATATABLE 
+		  GROUP BY PAYDATE, PRODUCT,CHANNEL) AS P 
+	LEFT JOIN @DATATABLE B1 ON B1.PRODUCT=P.PRODUCT AND B1.PAYDATE = P.PAYDATE AND B1.CHANNEL = P.CHANNEL AND B1.PAYMETHOD='BCO' AND B1.RESPONSECODE='0000'
+	LEFT JOIN @DATATABLE B2 ON B2.PRODUCT=P.PRODUCT AND B2.PAYDATE = P.PAYDATE AND B2.CHANNEL = P.CHANNEL AND B2.PAYMETHOD='BCO' AND B2.RESPONSECODE='Rechazada'
+	LEFT JOIN @DATATABLE B3 ON B3.PRODUCT=P.PRODUCT AND B3.PAYDATE = P.PAYDATE AND B3.CHANNEL = P.CHANNEL AND B3.PAYMETHOD='BCO' AND B3.RESPONSECODE='RetenidoEntidad'
+	LEFT JOIN @DATATABLE B4 ON B4.PRODUCT=P.PRODUCT AND B4.PAYDATE = P.PAYDATE AND B4.CHANNEL = P.CHANNEL AND B4.PAYMETHOD='BCO' AND B4.RESPONSECODE='RetenidoAS400'
+	LEFT JOIN @DATATABLE B5 ON B5.PRODUCT=P.PRODUCT AND B5.PAYDATE = P.PAYDATE AND B5.CHANNEL = P.CHANNEL AND B5.PAYMETHOD='BCO' AND B5.RESPONSECODE='Anulada') as a FULL JOIN (select P.PAYDATE, P.PRODUCT,p.CHANNEL , 
+		   ISNULL(B6.QUANTITY,0) AS COM_PROCESSED,
+		   ISNULL(B7.QUANTITY,0) AS COM_REJECTED,
+		   ISNULL(B8.QUANTITY,0) AS COM_RETENIDITY,
+		   ISNULL(B9.QUANTITY,0) AS COM_RETAINEDAS400,
+		   ISNULL(B0.QUANTITY,0) AS COM_CANCELED,
+		   (ISNULL(B6.QUANTITY,0)+ISNULL(B7.QUANTITY,0)+ISNULL(B8.QUANTITY,0)+ISNULL(B9.QUANTITY,0)+ISNULL(B0.QUANTITY,0)) AS COM_TOTAL,
+		   ((ISNULL(B6.QUANTITY,0)+ISNULL(B7.QUANTITY,0)+ISNULL(B8.QUANTITY,0)+ISNULL(B9.QUANTITY,0)+ISNULL(B0.QUANTITY,0))-
+		   (ISNULL(B7.QUANTITY,0)+ISNULL(B8.QUANTITY,0)+ISNULL(B9.QUANTITY,0)+ISNULL(B0.QUANTITY,0))) AS COM_SUCCESS,
+		   B6.AMOUNT AS COM_AMOUNT, B6.COMMISSION AS COM_COMMISSION
+	FROM (SELECT PAYDATE, PRODUCT ,CHANNEL
+	      FROM @DATATABLE 
+		  GROUP BY PAYDATE, PRODUCT,CHANNEL) AS P
+	LEFT JOIN @DATATABLE B6 ON B6.PRODUCT=P.PRODUCT AND B6.PAYDATE = P.PAYDATE AND B6.CHANNEL = P.CHANNEL AND B6.PAYMETHOD='COM' AND B6.RESPONSECODE='0000'
+	LEFT JOIN @DATATABLE B7 ON B7.PRODUCT=P.PRODUCT AND B7.PAYDATE = P.PAYDATE AND B7.CHANNEL = P.CHANNEL AND B7.PAYMETHOD='COM' AND B7.RESPONSECODE='Rechazada'
+	LEFT JOIN @DATATABLE B8 ON B8.PRODUCT=P.PRODUCT AND B8.PAYDATE = P.PAYDATE AND B8.CHANNEL = P.CHANNEL AND B8.PAYMETHOD='COM' AND B8.RESPONSECODE='RetenidoEntidad'
+	LEFT JOIN @DATATABLE B9 ON B9.PRODUCT=P.PRODUCT AND B9.PAYDATE = P.PAYDATE AND B9.CHANNEL = P.CHANNEL AND B9.PAYMETHOD='COM' AND B9.RESPONSECODE='RetenidoAS400'
+	LEFT JOIN @DATATABLE B0 ON B0.PRODUCT=P.PRODUCT AND B0.PAYDATE = P.PAYDATE AND B0.CHANNEL = P.CHANNEL AND B0.PAYMETHOD='COM' AND B0.RESPONSECODE='Anulada') as B ON a.PAYDATE = b.PAYDATE 
+	                                                                                                                                                                AND a.PRODUCT = b.PRODUCT 
+																																									AND a.CHANNEL = b.CHANNEL ) AS d 
+	ORDER BY PAYDATE, PRODUCT, CHANNEL 
+
+	
+	
+	
+	SET @I = 1
+	SET @NUMROWS = (SELECT COUNT(*) FROM @SUMMARYTABLE);
+		IF @NUMROWS > 0
+			WHILE(@I <= (SELECT MAX(RN) FROM @SUMMARYTABLE))
+			BEGIN
+
+				SELECT @TABLEROW = RN, 
+				       @PRODUCT  = PRODUCT,
+					   @PAYDATE  = PAYDATE ,
+					   @CHANNEL  = CHANNEL 
+				FROM @SUMMARYTABLE WHERE RN = @I;
+
+				IF (SELECT COUNT(*) FROM dbo.BL_TA_PAYMENTS_SUMMARY WHERE PAYDATE=@PAYDATE AND PRODUCT=@PRODUCT AND CHANNEL = @CHANNEL)=0
+					BEGIN
+						INSERT INTO dbo.BL_TA_PAYMENTS_SUMMARY (PAYDATE,PRODUCT,CHANNEL,BCO_PROCESSED,BCO_REJECTED,
+																	  BCO_RETENIDITY,BCO_RETAINEDAS400,BCO_CANCELED,
+																	  BCO_TOTAL,BCO_SUCCESS,BCO_EFFECTIVENESS,BCO_AMOUNT,
+																	  BCO_COMMISSION,COM_PROCESSED,COM_REJECTED,
+																	  COM_RETENIDITY,COM_RETAINEDAS400,COM_CANCELED,
+																	  COM_TOTAL,COM_SUCCESS,COM_EFFECTIVENESS,COM_AMOUNT,COM_COMMISSION )
+						SELECT PAYDATE,PRODUCT,CHANNEL,BCO_PROCESSED,BCO_REJECTED,BCO_RETENIDITY,BCO_RETAINEDAS400,BCO_CANCELED,BCO_TOTAL,BCO_SUCCESS,
+							   BCO_EFFECTIVENESS,BCO_AMOUNT,BCO_COMMISSION,COM_PROCESSED,COM_REJECTED,COM_RETENIDITY,COM_RETAINEDAS400,
+							   COM_CANCELED,COM_TOTAL,COM_SUCCESS,COM_EFFECTIVENESS ,COM_AMOUNT,COM_COMMISSION 
+						FROM @SUMMARYTABLE WHERE PAYDATE=@PAYDATE AND PRODUCT=@PRODUCT AND CHANNEL = @CHANNEL
+					END
+				ELSE
+					BEGIN
+						INSERT INTO @SUMMARYTABLE_REJECTED (RN,PAYDATE,PRODUCT,CHANNEL,BCO_PROCESSED,BCO_REJECTED,
+																		  BCO_RETENIDITY,BCO_RETAINEDAS400,BCO_CANCELED,
+																		  BCO_TOTAL,BCO_SUCCESS,BCO_EFFECTIVENESS,BCO_AMOUNT,
+																		  BCO_COMMISSION,COM_PROCESSED,COM_REJECTED,
+																		  COM_RETENIDITY,COM_RETAINEDAS400,COM_CANCELED,
+																		  COM_TOTAL,COM_SUCCESS,COM_EFFECTIVENESS,COM_AMOUNT,COM_COMMISSION )
+							SELECT RN,PAYDATE,PRODUCT,CHANNEL,BCO_PROCESSED,BCO_REJECTED,BCO_RETENIDITY,BCO_RETAINEDAS400,BCO_CANCELED,BCO_TOTAL,BCO_SUCCESS,
+								   BCO_EFFECTIVENESS,BCO_AMOUNT,BCO_COMMISSION,COM_PROCESSED,COM_REJECTED,COM_RETENIDITY,COM_RETAINEDAS400,
+								   COM_CANCELED,COM_TOTAL,COM_SUCCESS,COM_EFFECTIVENESS ,COM_AMOUNT,COM_COMMISSION 
+							FROM @SUMMARYTABLE WHERE PAYDATE=@PAYDATE AND PRODUCT=@PRODUCT AND CHANNEL = @CHANNEL
+					END
+
+				SET @I = @I + 1
+			END 
+	END 
+
+
+	
+	IF @RESPONSE_MODE = 0
+	BEGIN 
+		SELECT PAYDATE,PRODUCT,CHANNEL,BCO_PROCESSED,BCO_REJECTED,
+			   BCO_RETENIDITY,BCO_RETAINEDAS400,BCO_CANCELED,
+			   BCO_TOTAL,BCO_SUCCESS,BCO_EFFECTIVENESS,BCO_AMOUNT,
+			   BCO_COMMISSION,COM_PROCESSED,COM_REJECTED,
+			   COM_RETENIDITY,COM_RETAINEDAS400,COM_CANCELED,
+			   COM_TOTAL,COM_SUCCESS,COM_EFFECTIVENESS,COM_AMOUNT,COM_COMMISSION 
+		FROM BL_TA_PAYMENTS_SUMMARY 
+		WHERE PAYDATE BETWEEN @DATEINIT AND  @ENDDATE;
+	END 
+
+	IF @RESPONSE_MODE = 1 and @IDAFFILIATE = 0
+	BEGIN 
+	
+		SELECT c.afiliate_principal,
+			   C.year,
+			   C.month,
+			   (Sum(c.bco_total) + Sum(c.com_total))     AS TOTAL,
+			   (Sum(C.bco_success) + Sum(C.com_success)) AS SUCCESS,
+			   CASE
+				 WHEN Sum(c.bco_total + c.com_total) = 0 THEN 0
+				 ELSE ( Sum(C.bco_success + C.com_success) * 100 ) / Sum(
+					  c.bco_total + c.com_total)
+			   END                                AS EFFECTIVENESS,
+			   sum(c.BCO_AMOUNT+c.COM_AMOUNT) as AMOUNT,
+			   sum(c.BCO_COMMISSION+c.BCO_COMMISSION) as COMISSION 
+		FROM   (SELECT Isnull(p.description, 'Sin Relación AFP') AS AFILIATE_PRINCIPAL,
+					   af.description                             AS AFILIATE,
+					   b.product,
+					   b.CHANNEL,
+					   b.year,
+					   b.month,
+					   b.cant,
+					   b.bco_total,
+					   b.bco_success,
+					   b.BCO_AMOUNT,
+					   b.BCO_COMMISSION,
+					   b.com_total,
+					   b.com_success,
+					   b.com_amount,
+					   b.com_commission 
+				FROM   (SELECT a.year,
+							   a.month,
+							   a.product,
+							   a.CHANNEL,
+							   Count(*)           AS cant,
+							   Sum(a.bco_total)   AS BCO_TOTAL,
+							   Sum(a.bco_success) AS BCO_SUCCESS,
+							   Sum(a.com_total)   AS COM_TOTAL,
+							   Sum(a.com_success) AS COM_SUCCESS,
+							   Sum(a.BCO_AMOUNT) as BCO_AMOUNT,
+							   Sum(a.BCO_COMMISSION) as BCO_COMMISSION,
+							   Sum(a.COM_AMOUNT) as COM_AMOUNT,
+							   Sum(a.COM_COMMISSION) as COM_COMMISSION 
+						FROM   (SELECT Year(paydate)  AS year,
+									   Month(paydate) AS month,
+									   *
+								FROM   BL_TA_PAYMENTS_SUMMARY
+								WHERE  paydate >= @DATEINIT AND paydate <= @ENDDATE 
+								  and LTRIM(RTRIM(PRODUCT)) IN(SELECT DISTINCT PRODUCT
+								                               FROM @AFFILIATETABLE WHERE CLIENT=1) 
+															   ) AS a
+						GROUP  BY a.year,
+								  a.month,
+								  a.product,
+								  a.CHANNEL) AS b
+					   LEFT JOIN BL_TA_MERCHANT_DETAIL d ON d.MERCHANTDETAIL = b.product
+					   LEFT JOIN BL_TA_MERCHANT p        ON p.id_merchant = d.ID_MERCHANT
+					   LEFT JOIN @AFFILIATETABLE af      ON af.product = b.product ) AS c
+		GROUP  BY C.afiliate_principal,
+				  C.year,
+				  C.month
+		ORDER  BY afiliate_principal,
+				  year,
+				  month 
+    END 
+
+
+		IF @RESPONSE_MODE = 1 and @IDAFFILIATE != 0
+	BEGIN 
+	
+		SELECT c.afiliate_principal,
+			   C.year,
+			   C.month,
+			   (Sum(c.bco_total) + Sum(c.com_total))     AS TOTAL,
+			   (Sum(C.bco_success) + Sum(C.com_success)) AS SUCCESS,
+			   CASE
+				 WHEN Sum(c.bco_total + c.com_total) = 0 THEN 0
+				 ELSE ( Sum(C.bco_success + C.com_success) * 100 ) / Sum(
+					  c.bco_total + c.com_total)
+			   END                                AS EFFECTIVENESS,
+			   sum(c.BCO_AMOUNT+c.COM_AMOUNT) as AMOUNT,
+			   sum(c.BCO_COMMISSION+c.BCO_COMMISSION) as COMISSION 
+		FROM   (SELECT Isnull(p.description, 'Sin Relación AFP') AS AFILIATE_PRINCIPAL,
+					   af.description                             AS AFILIATE,
+					   b.product,
+					   b.CHANNEL,
+					   b.year,
+					   b.month,
+					   b.cant,
+					   b.bco_total,
+					   b.bco_success,
+					   b.BCO_AMOUNT,
+					   b.BCO_COMMISSION,
+					   b.com_total,
+					   b.com_success,
+					   b.com_amount,
+					   b.com_commission 
+				FROM   (SELECT a.year,
+							   a.month,
+							   a.product,
+							   a.CHANNEL,
+							   Count(*)           AS cant,
+							   Sum(a.bco_total)   AS BCO_TOTAL,
+							   Sum(a.bco_success) AS BCO_SUCCESS,
+							   Sum(a.com_total)   AS COM_TOTAL,
+							   Sum(a.com_success) AS COM_SUCCESS,
+							   Sum(a.BCO_AMOUNT) as BCO_AMOUNT,
+							   Sum(a.BCO_COMMISSION) as BCO_COMMISSION,
+							   Sum(a.COM_AMOUNT) as COM_AMOUNT,
+							   Sum(a.COM_COMMISSION) as COM_COMMISSION 
+						FROM   (SELECT Year(paydate)  AS year,
+									   Month(paydate) AS month,
+									   *
+								FROM   BL_TA_PAYMENTS_SUMMARY
+								WHERE  paydate >= @DATEINIT AND paydate <= @ENDDATE 
+								  and LTRIM(RTRIM(PRODUCT)) IN(SELECT DISTINCT PRODUCT
+								                               FROM @AFFILIATETABLE WHERE CLIENT=1) 
+															   ) AS a
+						GROUP  BY a.year,
+								  a.month,
+								  a.product,
+								  a.CHANNEL) AS b
+					   LEFT JOIN BL_TA_MERCHANT_DETAIL d ON d.MERCHANTDETAIL = b.product
+					   LEFT JOIN BL_TA_MERCHANT p        ON p.id_merchant = d.ID_MERCHANT
+					   LEFT JOIN @AFFILIATETABLE af      ON af.product = b.product 
+					   where p.ID_MERCHANT = @IDAFFILIATE ) AS c
+		GROUP  BY C.afiliate_principal,
+				  C.year,
+				  C.month
+		ORDER  BY afiliate_principal,
+				  year,
+				  month 
+    END 
+
+	IF @RESPONSE_MODE = 2 
+	BEGIN
+		 SELECT a.year,
+				a.month,
+				a.product,
+				a.CHANNEL,
+				Count(*) AS cant,
+				Sum(a.bco_total)   AS BCO_TOTAL,
+				Sum(a.bco_success) AS BCO_SUCCESS,
+				Sum(a.com_total)   AS COM_TOTAL,
+				Sum(a.com_success) AS COM_SUCCESS,
+				Sum(a.BCO_AMOUNT) as BCO_AMOUNT,
+				Sum(a.BCO_COMMISSION) as BCO_COMMISSION,
+				Sum(a.COM_AMOUNT) as COM_AMOUNT,
+				Sum(a.COM_COMMISSION) as COM_COMMISSION 
+		FROM   (SELECT Year(paydate)  AS year,
+		  		       Month(paydate) AS month, *
+					   FROM   BL_TA_PAYMENTS_SUMMARY
+					   WHERE  paydate BETWEEN @DATEINIT AND @ENDDATE
+					     AND PRODUCT IN(SELECT DISTINCT PRODUCT FROM @AFFILIATETABLE)) AS a
+					   GROUP  BY a.year,
+						         a.month,
+								 a.product,
+								 a.CHANNEL
+					   ORDER BY  year, month, product,channel
+	END 
+
+
+	IF @RESPONSE_MODE = 4 and @IDAFFILIATE != 0
+	BEGIN 
+		SELECT c.afiliate_principal,
+			   c.fecha,
+			   (Sum(c.bco_total) + Sum(c.com_total))     AS TOTAL,
+			   (Sum(C.bco_success) + Sum(C.com_success)) AS SUCCESS,
+			   CASE
+				 WHEN Sum(c.bco_total + c.com_total) = 0 THEN 0
+				 ELSE ( Sum(C.bco_success + C.com_success) * 100 ) / Sum(
+					  c.bco_total + c.com_total)
+			   END                                AS EFFECTIVENESS
+		FROM   (SELECT Isnull(p.description, 'Sin Relación AFP') AS AFILIATE_PRINCIPAL,
+					   af.description                             AS AFILIATE,
+					   b.product,
+					   b.CHANNEL,
+					   b.fecha,
+					   b.cant,
+					   b.bco_total,
+					   b.bco_success,
+					   b.com_total,
+					   b.com_success
+				FROM   (SELECT CAST(a.PAYDATE as date) fecha,
+							   a.product,
+							   a.CHANNEL,
+							   Count(*)           AS cant,
+							   Sum(a.bco_total)   AS BCO_TOTAL,
+							   Sum(a.bco_success) AS BCO_SUCCESS,
+							   Sum(a.com_total)   AS COM_TOTAL,
+							   Sum(a.com_success) AS COM_SUCCESS
+						FROM   (SELECT
+									   *
+								FROM   BL_TA_PAYMENTS_SUMMARY
+								WHERE  paydate >= @DATEINIT AND paydate <= @ENDDATE 
+								  AND PRODUCT IN(SELECT DISTINCT PRODUCT FROM @AFFILIATETABLE WHERE CLIENT=1)) AS a
+						GROUP  BY a.PAYDATE,
+								  a.product,
+								  a.CHANNEL) AS b
+					   LEFT JOIN BL_TA_MERCHANT_DETAIL d ON d.MERCHANTDETAIL = b.product
+					   LEFT JOIN BL_TA_MERCHANT p ON p.id_merchant = d.ID_MERCHANT
+					   LEFT JOIN @AFFILIATETABLE af ON af.product = b.product 
+					   where p.ID_MERCHANT = @IDAFFILIATE) AS c
+		GROUP  BY C.afiliate_principal,
+				 c.fecha
+		ORDER  BY afiliate_principal,
+				  c.fecha
+    END
+
+
+	IF @RESPONSE_MODE = 5 and @IN_CHANNEL='Todos'
+	BEGIN
+		select channel,year,month,success,amount,commission 
+		from 
+		 (SELECT a.year,
+				a.month,
+				a.CHANNEL,
+				Count(*) AS cant,
+				Sum(a.bco_total+a.COM_TOTAL)   AS TOTAL,
+				Sum(a.bco_success+a.COM_SUCCESS) AS SUCCESS,
+				Sum(a.BCO_AMOUNT+a.COM_AMOUNT) as AMOUNT,
+				Sum(a.BCO_COMMISSION+a.COM_COMMISSION) as COMMISSION
+		FROM   (SELECT Year(paydate)  AS year,
+		  		       Month(paydate) AS month, *
+					   FROM   BL_TA_PAYMENTS_SUMMARY
+					   WHERE  paydate BETWEEN @DATEINIT AND @ENDDATE 
+					     AND PRODUCT IN(SELECT DISTINCT PRODUCT FROM @AFFILIATETABLE) ) AS a
+					   GROUP  BY a.year,
+						         a.month,
+								 a.CHANNEL) as b
+					   ORDER BY  channel, year, MONTH
+	END 
+
+	IF @RESPONSE_MODE = 5 and @IN_CHANNEL!='Todos'
+	BEGIN
+		select channel,year,month,success,amount,commission 
+		from 
+		 (SELECT a.year,
+				a.month,
+				a.CHANNEL,
+				Count(*) AS cant,
+				Sum(a.bco_total+a.COM_TOTAL)   AS TOTAL,
+				Sum(a.bco_success+a.COM_SUCCESS) AS SUCCESS,
+				Sum(a.BCO_AMOUNT+a.COM_AMOUNT) as AMOUNT,
+				Sum(a.BCO_COMMISSION+a.COM_COMMISSION) as COMMISSION
+		FROM   (SELECT Year(paydate)  AS year,
+		  		       Month(paydate) AS month, *
+					   FROM   BL_TA_PAYMENTS_SUMMARY
+					   WHERE  paydate BETWEEN @DATEINIT AND @ENDDATE and CHANNEL=@IN_CHANNEL 
+					   AND PRODUCT IN(SELECT DISTINCT PRODUCT FROM @AFFILIATETABLE)) AS a
+					   GROUP  BY a.year,
+						         a.month,
+								 a.CHANNEL) as b
+					   ORDER BY  channel, year, MONTH
+	END
+
+
+	IF @RESPONSE_MODE = 6 and @IN_CHANNEL='Todos'
+	BEGIN
+		SELECT cast(e.PAYDATE as date) as day,
+			   e.PRODUCT AS PRODUCT,
+			   a.description as AFILIATE_NAME,
+			   a.CLIENT,
+			   sum(e.BCO_SUCCESS) as BCO_SUCCESS,
+			   sum(e.BCO_AMOUNT) BCO_AMOUNT,
+			   sum(e.BCO_COMMISSION) as BCO_COMMISSION,
+			   sum(e.COM_SUCCESS) as COM_SUCCESS,
+			   sum(e.COM_AMOUNT) COM_AMOUNT,
+			   sum(e.COM_COMMISSION) as COM_COMMISSION
+		from BL_TA_PAYMENTS_SUMMARY e 
+		left join @AFFILIATETABLE a on a.PRODUCT = e.PRODUCT
+		where e.PAYDATE between @DATEINIT and @ENDDATE AND e.PRODUCT IN(SELECT DISTINCT PRODUCT FROM @AFFILIATETABLE)
+		GROUP BY cast(e.PAYDATE as date),e.PRODUCT, a.DESCRIPTION, a.CLIENT 
+		ORDER BY day, PRODUCT
+
+	END 
+
+	
+	IF @RESPONSE_MODE = 6 and @IN_CHANNEL!='Todos'
+	BEGIN
+		SELECT cast(e.PAYDATE as date) as day,
+			   e.PRODUCT AS PRODUCT,
+			   a.description as AFILIATE_NAME,
+			   a.CLIENT,
+			   sum(e.BCO_SUCCESS) as BCO_SUCCESS,
+			   sum(e.BCO_AMOUNT) BCO_AMOUNT,
+			   sum(e.BCO_COMMISSION) as BCO_COMMISSION,
+			   sum(e.COM_SUCCESS) as COM_SUCCESS,
+			   sum(e.COM_AMOUNT) COM_AMOUNT,
+			   sum(e.COM_COMMISSION) as COM_COMMISSION
+		from BL_TA_PAYMENTS_SUMMARY e 
+		left join @AFFILIATETABLE a on a.PRODUCT = e.PRODUCT
+		where e.PAYDATE between @DATEINIT and @ENDDATE AND e.PRODUCT IN(SELECT DISTINCT PRODUCT FROM @AFFILIATETABLE)
+		  and a.DESCRIPTION=@IN_CHANNEL 
+		GROUP BY cast(e.PAYDATE as date),e.PRODUCT, a.DESCRIPTION, a.CLIENT 
+		ORDER BY day, PRODUCT
+
+	END 
+	
+
+
+	
+	END 
